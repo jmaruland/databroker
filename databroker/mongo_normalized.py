@@ -573,8 +573,8 @@ class DatasetFromDocuments:
                 columns,
             )
         except Exception as err:
-            if "full error" in err.args[0]:
-                _, error_json = err.args[0].split("full error", 1)
+            if "full error: " in err.args[0]:
+                _, error_json = err.args[0].split("full error: ", 1)
                 error = json.loads(error_json)
                 if error["code"] != 10334:
                     raise
