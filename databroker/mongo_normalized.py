@@ -559,8 +559,100 @@ class DatasetFromDocuments:
         data_keys = [descriptors[0]["data_keys"][key] for key in keys]
         is_externals = ["external" in data_key for data_key in data_keys]
         expected_shapes = [tuple(data_key["shape"] or []) for data_key in data_keys]
+
+        # This is a kludge-y solution to
+        # https://github.com/bluesky/databroker/issues/667
+        try:
+            self._fetch_range_of_columns(
+                descriptors,
+                min_seq_num,
+                max_seq_num,
+                keys,
+                expected_shapes,
+                is_externals,
+                columns,
+            )
+        except Exception as err:
+            if "full error" in err.args[0]:
+                _, error_json = err.args[0].split("full error", 1)
+                error = json.loads(error_json)
+                if error["code"] != 10334:
+                    raise
+            else:
+                raise
+            MAX_ATTEMPTS = 8
+            for n in range(MAX_ATTEMPTS):
+                columns.clear()
+                boundaries = list(range(min_seq_num, 1 + max_seq_num, 2 ** n))
+                for min_, max_ in zip(boundaries[:-1], boundaries[1:]):
+                    try:
+                        self._fetch_range_of_columns(
+                            descriptors,
+                            min_,
+                            max_,
+                            keys,
+                            expected_shapes,
+                            is_externals,
+                            columns,
+                        )
+                    except Exception:
+                        break
+                        # Try again with smaller min--max ranges.
+            else:
+                # Give up.
+                raise
+
+        result = {}
         # If data is external, we now have a column of datum_ids, and we need
         # to look up the data that they reference.
+        for key, expected_shape, is_external in zip(
+            keys, expected_shapes, is_externals
+        ):
+            column = columns[key]
+            if is_external:
+                filled_column = []
+                for datum_id in column:
+                    # HACK to adapt Filler which is designed to consume whole,
+                    # streamed documents, to this column-based access mode.
+                    mock_event = {
+                        "data": {key: datum_id},
+                        "descriptor": "PLACEHOLDER",
+                        "uid": "PLACEHOLDER",
+                        "filled": {key: False},
+                    }
+                    filled_mock_event = _fill(
+                        self._run.filler,
+                        mock_event,
+                        self._run.lookup_resource_for_datum,
+                        self._run.get_resource,
+                        self._run.get_datum_for_resource,
+                        last_datum_id=None,
+                    )
+                    filled_data = filled_mock_event["data"][key]
+                    validated_filled_data = _validate_shape(filled_data, expected_shape)
+                    filled_column.append(validated_filled_data)
+                to_stack = filled_column
+            else:
+                to_stack = column
+            array = numpy.stack(to_stack)
+            if slices:
+                sliced_array = array[(..., *slices[1:])]
+            else:
+                sliced_array = array
+            result[key] = sliced_array
+        return result
+
+    def _fetch_range_of_columns(
+        self,
+        descriptors,
+        min_seq_num,
+        max_seq_num,
+        keys,
+        expected_shapes,
+        is_externals,
+        columns,
+    ):
+        "This is used by _get_columns."
         for descriptor in sorted(descriptors, key=lambda d: d["time"]):
             # TODO When seq_num is repeated, take the last one only (sorted by
             # time).
@@ -614,45 +706,6 @@ class DatasetFromDocuments:
                 else:
                     validated_column = result[key]
                 columns[key].extend(validated_column)
-
-        result = {}
-        for key, expected_shape, is_external in zip(
-            keys, expected_shapes, is_externals
-        ):
-            column = columns[key]
-            if is_external:
-                filled_column = []
-                descriptor_uid = descriptor["uid"]
-                for datum_id in column:
-                    # HACK to adapt Filler which is designed to consume whole,
-                    # streamed documents, to this column-based access mode.
-                    mock_event = {
-                        "data": {key: datum_id},
-                        "descriptor": descriptor_uid,
-                        "uid": "PLACEHOLDER",
-                        "filled": {key: False},
-                    }
-                    filled_mock_event = _fill(
-                        self._run.filler,
-                        mock_event,
-                        self._run.lookup_resource_for_datum,
-                        self._run.get_resource,
-                        self._run.get_datum_for_resource,
-                        last_datum_id=None,
-                    )
-                    filled_data = filled_mock_event["data"][key]
-                    validated_filled_data = _validate_shape(filled_data, expected_shape)
-                    filled_column.append(validated_filled_data)
-                to_stack = filled_column
-            else:
-                to_stack = column
-            array = numpy.stack(to_stack)
-            if slices:
-                sliced_array = array[(..., *slices[1:])]
-            else:
-                sliced_array = array
-            result[key] = sliced_array
-        return result
 
 
 class Config(TreeInMemory):
