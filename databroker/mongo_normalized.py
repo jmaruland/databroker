@@ -577,6 +577,7 @@ class DatasetFromDocuments:
                 _, error_dict = err.args[0].split("full error: ", 1)
                 error_json = error_dict.replace("'", "\"")
                 error = json.loads(error_json)
+                print("DAN", error_json)
                 if error["code"] != 10334:
                     raise
             else:
