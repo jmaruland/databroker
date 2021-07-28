@@ -6,7 +6,6 @@ import pymongo
 from pymongo import MongoClient
 from . import mongo_core
 from .base import MDSROTemplate, MDSTemplate
-from databroker.v1 import _get_mongo_database
 
 class MDSRO(MDSROTemplate):
     _API_MAP = {1: mongo_core}
@@ -99,7 +98,7 @@ class MDSRO(MDSROTemplate):
     @property
     def _db(self):
         if self.__db is None:
-            self.__db = _get_mongo_database(self.config)
+            self.__db = self.config['database']
         return self.__db
 
     @property

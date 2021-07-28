@@ -5,7 +5,6 @@ import logging
 import pymongo
 
 from pymongo import MongoClient
-from databroker.v1 import _get_mongo_database
 
 from . import mongo_core
 
