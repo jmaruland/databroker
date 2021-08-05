@@ -54,7 +54,7 @@ def key_from_filename(filename):
     return Path(filename).stem
 
 
-class Tree(FileTree):
+class JSONLTree(FileTree):
 
     # This is set up in Tree.from_directory.
     DEFAULT_READERS_BY_MIMETYPE = {}
@@ -66,13 +66,61 @@ class Tree(FileTree):
 
         tree = MongoNormalizedTree.from_mongomock(**kwargs)
         jsonl_reader = JSONLReader(tree)
-        msgpack_reader = MsgpackReader(tree)
         mimetypes_by_file_ext = {
             ".jsonl": "application/x-bluesky-jsonl",
-            ".msgpack": "application/x-bluesky-msgpack",
         }
         readers_by_mimetype = {
             "application/x-bluesky-jsonl": jsonl_reader.consume_file,
+        }
+        return super().from_directory(
+            directory,
+            readers_by_mimetype=readers_by_mimetype,
+            mimetypes_by_file_ext=mimetypes_by_file_ext,
+            key_from_filename=key_from_filename,
+            error_if_missing=False,
+            tree=tree,
+        )
+
+    def __init__(self, *args, tree, directory, **kwargs):
+        self._tree = tree
+        self._directory = directory
+        super().__init__(*args, **kwargs)
+
+    @property
+    def database(self):
+        return self._tree.database
+
+    def get_serializer(self):
+        import event_model
+        from suitcase.jsonl import Serializer
+        def factory(name, doc):
+            return Serializer(self._directory)
+        rr = event_model.RunRouter([factory])
+        return rr
+
+    def new_variation(self, **kwargs):
+        return super().new_variation(tree=self._tree, **kwargs)
+
+    def search(self, *args, **kwargs):
+        return self._tree.search(*args, **kwargs)
+
+
+class MsgpackTree(FileTree):
+
+    # This is set up in Tree.from_directory.
+    DEFAULT_READERS_BY_MIMETYPE = {}
+
+    specs = ["CatalogOfBlueskyRuns"]
+
+    @classmethod
+    def from_directory(cls, directory, **kwargs):
+
+        tree = MongoNormalizedTree.from_mongomock(**kwargs)
+        msgpack_reader = MsgpackReader(tree)
+        mimetypes_by_file_ext = {
+            ".msgpack": "application/x-bluesky-msgpack",
+        }
+        readers_by_mimetype = {
             "application/x-bluesky-msgpack": msgpack_reader.consume_file,
         }
         return super().from_directory(
@@ -91,6 +139,14 @@ class Tree(FileTree):
     @property
     def database(self):
         return self._tree.database
+
+    def get_serializer(self):
+        import event_model
+        from suitcase.msgpack import Serializer
+        def factory(name, doc):
+            return Serializer(self.directory)
+        rr = event_model.RunRouter([factory])
+        return rr
 
     def new_variation(self, **kwargs):
         return super().new_variation(tree=self._tree, **kwargs)

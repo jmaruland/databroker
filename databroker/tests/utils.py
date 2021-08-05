@@ -29,7 +29,7 @@ def build_tiled_jsonl_backed_broker(request):
         tmp_dir.cleanup()
 
     request.addfinalizer(teardown)
-    tree = from_files.Tree.from_directory(
+    tree = from_files.JSONLTree.from_directory(
         f"{tmp_dir.name}/*.jsonl",
         handler_registry={'NPY_SEQ': ophyd.sim.NumpySeqHandler})
     client = from_tree(tree)
