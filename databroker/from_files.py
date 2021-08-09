@@ -81,9 +81,8 @@ class JSONLTree(FileTree):
             tree=tree,
         )
 
-    def __init__(self, *args, tree, directory, **kwargs):
+    def __init__(self, *args, tree, **kwargs):
         self._tree = tree
-        self._directory = directory
         super().__init__(*args, **kwargs)
 
     @property
@@ -92,9 +91,21 @@ class JSONLTree(FileTree):
 
     def get_serializer(self):
         import event_model
+        import time
         from suitcase.jsonl import Serializer
+        tree = self  # since 'self' is shadowed below to mean Serializer's self
+
+        class SerializerWithUpdater(Serializer):
+            def stop(self, doc):
+                super().stop(doc)
+                # Blocks until this new Run is processed by the tree.
+                tree.update_now()
+                time.sleep(3)
+
         def factory(name, doc):
-            return Serializer(self._directory)
+            serializer = SerializerWithUpdater(self.directory)
+            return [serializer], []
+
         rr = event_model.RunRouter([factory])
         return rr
 
@@ -141,10 +152,22 @@ class MsgpackTree(FileTree):
         return self._tree.database
 
     def get_serializer(self):
+        import time
         import event_model
         from suitcase.msgpack import Serializer
+        tree = self  # since 'self' is shadowed below to mean Serializer's self
+
+        class SerializerWithUpdater(Serializer):
+            def stop(self, doc):
+                super().stop(doc)
+                # Blocks until this new Run is processed by the tree.
+                tree.update_now()
+                time.sleep(3)
+
         def factory(name, doc):
-            return Serializer(self.directory)
+            serializer = SerializerWithUpdater(self.directory)
+            return [serializer], []
+
         rr = event_model.RunRouter([factory])
         return rr
 
