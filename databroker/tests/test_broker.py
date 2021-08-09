@@ -61,6 +61,7 @@ def test_header_equality(db, RE, hw):
 
 def test_no_descriptor_name(db, RE, hw):
     def local_insert(name, doc):
+        print(name)
         doc.pop('name', None)
         return db.insert(name, doc)
     RE.subscribe(local_insert)
