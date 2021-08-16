@@ -21,7 +21,8 @@ class JSONLReader:
         with open(filepath) as file:
             lines = iter(file)
             name, doc = json.loads(next(lines))
-            assert name == "start"
+            if name != "start":
+                raise ValueError("File is expected to start with ('start', {...})")
             uid = doc["uid"]
             self._mongo_normalized_serializer(name, doc)
             for line in lines:
