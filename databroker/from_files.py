@@ -13,7 +13,7 @@ class JSONLReader:
     def __init__(self, tree):
         self._tree = tree
         database = tree.database
-        self._serializer = Serializer(database, database)
+        self._mongo_normalized_serializer = Serializer(database, database)
 
     def consume_file(self, filepath):
         import json
@@ -23,10 +23,10 @@ class JSONLReader:
             name, doc = json.loads(next(lines))
             assert name == "start"
             uid = doc["uid"]
-            self._serializer(name, doc)
+            self._mongo_normalized_serializer(name, doc)
             for line in lines:
                 name, doc = json.loads(line)
-                self._serializer(name, doc)
+                self._mongo_normalized_serializer(name, doc)
         return self._tree[uid]
 
 
