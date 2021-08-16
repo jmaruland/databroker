@@ -38,16 +38,21 @@ class MsgpackReader:
     def __init__(self, tree):
         self._tree = tree
         database = tree.database
-        self._serializer = Serializer(database, database)
+        self._mongo_normalized_serializer = Serializer(database, database)
 
     def consume_file(self, filepath):
         import msgpack
 
-        with open(filepath) as file:
-            for name, doc in msgpack.Unpacker(file):
-                self._serializer(name, doc)
-
-        return self._tree[self._ser]
+        with open(filepath, "rb") as file:
+            with msgpack.Unpacker(file) as items:
+                name, doc = next(items)
+                if name != "start":
+                    raise ValueError("File is expected to start with ('start', {...})")
+                uid = doc["uid"]
+                self._mongo_normalized_serializer(name, doc)
+                for name, doc in items:
+                    self._mongo_normalized_serializer(name, doc)
+        return self._tree[uid]
 
 
 def key_from_filename(filename):
@@ -94,6 +99,7 @@ class JSONLTree(FileTree):
         import event_model
         import time
         from suitcase.jsonl import Serializer
+
         tree = self  # since 'self' is shadowed below to mean Serializer's self
 
         class SerializerWithUpdater(Serializer):
@@ -156,6 +162,7 @@ class MsgpackTree(FileTree):
         import time
         import event_model
         from suitcase.msgpack import Serializer
+
         tree = self  # since 'self' is shadowed below to mean Serializer's self
 
         class SerializerWithUpdater(Serializer):
