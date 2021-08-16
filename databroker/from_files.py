@@ -63,6 +63,7 @@ class JSONLTree(FileTree):
 
     @classmethod
     def from_directory(cls, directory, **kwargs):
+
         tree = MongoNormalizedTree.from_mongomock(**kwargs)
         jsonl_reader = JSONLReader(tree)
         mimetypes_by_file_ext = {
@@ -90,7 +91,8 @@ class JSONLTree(FileTree):
 
     def get_serializer(self):
         import event_model
-        from suitcase.jsonl import Serializer as JSONLSerializer
+        import time
+        from suitcase.jsonl import Serializer
         tree = self  # since 'self' is shadowed below to mean Serializer's self
 
         class SerializerWithUpdater(Serializer):
@@ -98,12 +100,11 @@ class JSONLTree(FileTree):
                 super().stop(doc)
                 # Blocks until this new Run is processed by the tree.
                 tree.update_now()
+                time.sleep(3)
 
         def factory(name, doc):
-            jsonl_serializer = JSONLSerializer(self.directory)
-            database = self._tree.database
-            mongomock_serializer = SerializerWithUpdater(database, database)
-            return [mongomock_serializer, jsonl_serializer], []
+            serializer = SerializerWithUpdater(self.directory)
+            return [serializer], []
 
         rr = event_model.RunRouter([factory])
         return rr
@@ -153,19 +154,19 @@ class MsgpackTree(FileTree):
     def get_serializer(self):
         import time
         import event_model
-        from suitcase.msgpack import Serializer as MsgpackSerializer
+        from suitcase.msgpack import Serializer
         tree = self  # since 'self' is shadowed below to mean Serializer's self
+
         class SerializerWithUpdater(Serializer):
             def stop(self, doc):
                 super().stop(doc)
                 # Blocks until this new Run is processed by the tree.
                 tree.update_now()
+                time.sleep(3)
 
         def factory(name, doc):
-            msgpack_serializer = MsgpackSerializer(self.directory)
-            database = self._tree.database
-            mongomock_serializer = SerializerWithUpdater(database, database)
-            return [mongomock_serializer, msgpack_serializer], []
+            serializer = SerializerWithUpdater(self.directory)
+            return [serializer], []
 
         rr = event_model.RunRouter([factory])
         return rr
