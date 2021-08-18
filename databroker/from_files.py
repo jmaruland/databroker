@@ -85,6 +85,10 @@ class JSONLTree(FileTree):
             key_from_filename=key_from_filename,
             error_if_missing=False,
             tree=tree,
+            # Create Reader right away, not waiting until it is
+            # first accessed, so that the mongomock database is
+            # populated.
+            greedy=True,
         )
 
     def __init__(self, *args, tree, **kwargs):
@@ -148,6 +152,10 @@ class MsgpackTree(FileTree):
             key_from_filename=key_from_filename,
             error_if_missing=False,
             tree=tree,
+            # Create Reader right away, not waiting until it is
+            # first accessed, so that the mongomock database is
+            # populated.
+            greedy=True,
         )
 
     def __init__(self, *args, tree, **kwargs):
