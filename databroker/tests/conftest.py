@@ -1,3 +1,5 @@
+import contextlib
+import getpass
 import os
 import pytest
 import sys
@@ -41,6 +43,11 @@ params = [
 @pytest.fixture(params=params, scope='module')
 def db(request):
     return param_map[request.param](request)
+
+
+@pytest.fixture
+def c(request):
+    return build_tiled_mongo_backed_broker(request).v2
 
 
 @pytest.fixture(params=params, scope='function')
@@ -109,3 +116,22 @@ SIM_DETECTORS = {'scalar': 'det',
 @pytest.fixture(params=['scalar', 'image', 'external_image'])
 def detector(request, hw):
     return getattr(hw, SIM_DETECTORS[request.param])
+
+
+@pytest.fixture
+def enter_password(monkeypatch):
+    """
+    Return a context manager that overrides getpass, used like:
+
+    >>> with enter_password(...):
+    ...     # Run code that calls getpass.getpass().
+    """
+
+    @contextlib.contextmanager
+    def f(password):
+        original = getpass.getpass
+        monkeypatch.setattr("getpass.getpass", lambda: password)
+        yield
+        monkeypatch.setattr("getpass.getpass", original)
+
+    return f

@@ -3,13 +3,18 @@ cachetools
 entrypoints
 event-model
 fastapi
+jsonschema
 mongomock
 msgpack >=1.0.0
 pims
 pydantic
 pymongo
 pytz
+rich
 starlette
-tiled[server] >=0.1.0a60
+suitcase-mongo
+tiled[server] >=0.1.0a89
 toolz
+typer
 tzlocal
+zarr

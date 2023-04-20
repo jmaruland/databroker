@@ -4,8 +4,9 @@ import warnings
 
 import msgpack
 from tiled.adapters.utils import IndexCallable
-from tiled.client.node import Node
+from tiled.client.node import DEFAULT_STRUCTURE_CLIENT_DISPATCH, Node
 from tiled.client.utils import handle_error
+from tiled.utils import safe_json_dump
 
 from .common import BlueskyEventStreamMixin, BlueskyRunMixin, CatalogOfBlueskyRunsMixin
 from .queries import PartialUID, RawMongo, ScanID
@@ -64,15 +65,16 @@ class BlueskyRun(BlueskyRunMixin, Node):
             raise NotImplementedError("fill='delayed' is not supported")
         else:
             fill = bool(fill)
-        # Access internal object context._client here because
-        # Context does not yet expose a streaming API.
-        request = self.context._client.build_request(
+        link = self.item["links"]["self"].replace(
+            "/node/metadata", "/documents", 1
+        )
+        request = self.context.http_client.build_request(
             "GET",
-            f"/documents/{'/'.join(list(self.context.path_parts) + list(self._path))}",
+            link,
             params={"fill": fill},
             headers={"Accept": "application/x-msgpack"},
         )
-        response = self.context._client.send(request, stream=True)
+        response = self.context.http_client.send(request, stream=True)
         try:
             if response.is_error:
                 response.read()
@@ -80,8 +82,8 @@ class BlueskyRun(BlueskyRunMixin, Node):
             unpacker = msgpack.Unpacker()
             for chunk in response.iter_bytes():
                 unpacker.feed(chunk)
-                for name, doc in unpacker:
-                    yield (name, _document_types[name](doc))
+                for item in unpacker:
+                    yield (item["name"], _document_types[item["name"]](item["doc"]))
         finally:
             response.close()
 
@@ -206,7 +208,7 @@ and then read() will return dask objects.""",
             stacklevel=2,
         )
         return self.new_variation(
-            structure_clients=Node.DEFAULT_STRUCTURE_CLIENT_DISPATCH["dask"]
+            structure_clients=DEFAULT_STRUCTURE_CLIENT_DISPATCH["dask"]
         ).read()
 
 
@@ -218,7 +220,7 @@ class CatalogOfBlueskyRuns(CatalogOfBlueskyRunsMixin, Node):
     >>> catalog.uid["9acjef"]  # (partial) uid lookup
     >>> catalog[1234]  # automatically do scan_id lookup for positive integer
     >>> catalog["9acjef"]  # automatically do (partial) uid lookup for string
-    >>> catalog[-5]  # automatically do catalog.values_indexer[-N] for negative integer
+    >>> catalog[-5]  # automatically do catalog.values()[-N] for negative integer
     """
 
     def __init__(self, *args, **kwargs):
@@ -247,15 +249,15 @@ class CatalogOfBlueskyRuns(CatalogOfBlueskyRunsMixin, Node):
             else:
                 # CASE 3: Interpret key as a recently lookup, as in
                 # `catalog[-1]` is the latest entry.
-                return self.values_indexer[key]
+                return self.values()[key]
         elif isinstance(key, slice):
             if (key.start is None) or (key.start >= 0):
                 raise ValueError(
                     "For backward-compatibility reasons, slicing here "
                     "is limited to negative indexes. "
-                    "Use .values_indexer to slice how you please."
+                    "Use .values() to slice how you please."
                 )
-            return self.values_indexer.__getitem__(key)
+            return self.values()[key]
         elif isinstance(key, collections.abc.Iterable):
             # We know that isn't a str because we check that above.
             # Recurse.
@@ -271,7 +273,7 @@ class CatalogOfBlueskyRuns(CatalogOfBlueskyRunsMixin, Node):
             raise KeyError(f"No match for scan_id={scan_id}")
         else:
             # By construction there must be only one result. Return it.
-            return results.values_indexer[0]
+            return results.values().first()
 
     def _lookup_by_partial_uid(self, partial_uid):
         results = self.search(PartialUID(partial_uid))
@@ -279,14 +281,14 @@ class CatalogOfBlueskyRuns(CatalogOfBlueskyRunsMixin, Node):
             raise KeyError(f"No match for partial_uid {partial_uid}")
         else:
             # By construction there must be only one result. Return it.
-            return results.values_indexer[0]
+            return results.values().first()
 
     def get_serializer(self):
         from tiled.server.app import get_root_tree
 
-        if self.context.app is None:
+        if not hasattr(self.context.http_client, "app"):
             raise NotImplementedError("Only works on local application.")
-        tree = self.context.app.dependency_overrides[get_root_tree]()
+        tree = self.context.http_client.app.dependency_overrides[get_root_tree]()
         return tree.get_serializer()
 
     def search(self, query):
@@ -304,3 +306,13 @@ class CatalogOfBlueskyRuns(CatalogOfBlueskyRunsMixin, Node):
 
             self._v1 = Broker(self)
         return self._v1
+
+    def post_document(self, name, doc):
+        link = self.item["links"]["self"].replace(
+            "/node/metadata", "/documents", 1
+        )
+        response = self.context.http_client.post(
+            link,
+            data=safe_json_dump({"name": name, "doc": doc})
+        )
+        handle_error(response)

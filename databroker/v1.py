@@ -19,9 +19,10 @@ except ImportError:
     from toolz.dicttoolz import merge
 
 from tiled.client import from_profile
-from tiled.queries import FullText
+from tiled.client.utils import ClientError
+from tiled.queries import FullText, Key
 
-from .queries import RawMongo, TimeRange
+from .queries import TimeRange
 from .utils import ALL, get_fields, wrap_in_deprecated_doct
 
 
@@ -119,15 +120,6 @@ class Broker:
         self.v2._Broker__v1 = self
         self._reg = Registry(catalog)
 
-        # When the user asks for a Serializer, give a RunRouter
-        # that will generate a fresh Serializer instance for each
-        # run.
-
-        def factory(name, doc):
-            return [self._catalog.get_serializer()], []
-
-        self._run_router = event_model.RunRouter([factory])
-
     @property
     def aliases(self):
         _no_aliases()
@@ -149,10 +141,6 @@ class Broker:
 
     def clear_filters(self, *args, **kwargs):
         _no_filters()
-
-    @property
-    def _serializer(self):
-        return self._run_router
 
     @property
     def reg(self):
@@ -187,7 +175,7 @@ class Broker:
         raise NotImplementedError("No longer supported")
 
     @classmethod
-    def named(cls, name, auto_register=None):
+    def named(cls, name, auto_register=None, try_raw=True):
         """
         Create a new Broker instance using the Tiled profile of this name.
 
@@ -206,6 +194,10 @@ class Broker:
             By default, automatically register built-in asset handlers (classes
             that handle I/O for externally stored data). Set this to ``False``
             to do all registration manually.
+        try_raw: boolean, optional
+            This is a backward-compatibilty shim. Raw data has been moved from
+            "xyz" to "xyz/raw" in many deployments. If true, check to see if an item
+            named "raw" is contained in this node and, if so, uses that.
 
         Returns
         -------
@@ -218,9 +210,14 @@ class Broker:
                 "from the client."
             )
         if name == "temp":
-            raise NotImplementedError("databroker 2.0.0 does not yet support 'temp' Broker")
-        catalog = from_profile(name)
-        return Broker(catalog)
+            return temp()
+        client = from_profile(name)
+        if try_raw:
+            try:
+                client = client["raw"]
+            except (ClientError, KeyError):
+                pass
+        return Broker(client)
 
     @property
     def fs(self):
@@ -244,8 +241,8 @@ class Broker:
             )
         if "data_key" in kwargs:
             raise NotImplementedError("Search by data key is no longer implemented.")
-        if kwargs:
-            results_catalog = results_catalog.search(RawMongo(start=kwargs))
+        for key, value in kwargs.items():
+            results_catalog = results_catalog.search(Key(key) == value)
         if text_search:
             results_catalog = results_catalog.search(FullText(text_search))
         self._patch_state(results_catalog)
@@ -545,13 +542,13 @@ class Broker:
             dataset.load()
             dict_of_arrays = {}
             for var_name in dataset:
-                column = dataset[var_name].data
+                column = dataset[var_name][:].data
                 if column.ndim > 1:
                     column = list(column)  # data must be 1-dimensional
                 dict_of_arrays[var_name] = column
             df = pandas.DataFrame(dict_of_arrays)
             # if converting to datetime64 (in utc or 'local' tz)
-            times = dataset["time"].data
+            times = dataset["time"][:].data
             if convert_times or localize_times:
                 times = pandas.to_datetime(times, unit="s")
             # make sure this is a series
@@ -771,14 +768,7 @@ class Broker:
         return total_size * 1e-9
 
     def insert(self, name, doc):
-        if self._serializer is None:
-            raise RuntimeError("No Serializer was configured for this.")
-        warnings.warn(
-            "The method Broker.insert may be removed in a future release of "
-            "databroker.",
-            PendingDeprecationWarning,
-        )
-        self._serializer(name, doc)
+        self.v2.post_document(name, doc)
 
     def fill_event(*args, **kwargs):
         raise NotImplementedError(
@@ -1034,7 +1024,7 @@ class Header:
         """
         if not fill:
             raise ValueError("Only fill=True is now supported by the data(...) method.")
-        for item in self._run[stream_name]["data"][field].data:
+        for item in self._run[stream_name]["data"][field][:]:
             yield item
 
     def stream(self, *args, **kwargs):

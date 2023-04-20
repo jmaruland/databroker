@@ -5,7 +5,6 @@ import copy
 from datetime import datetime, timedelta
 import functools
 import itertools
-import json
 import logging
 import os
 import sys
@@ -15,6 +14,7 @@ from bson.objectid import ObjectId, InvalidId
 import cachetools
 import entrypoints
 import event_model
+import dask.array
 from dask.array.core import cached_cumsum, normalize_chunks
 import numpy
 import pymongo
@@ -22,6 +22,8 @@ import pymongo.errors
 import toolz.itertoolz
 import xarray
 
+from tiled.access_policies import ALL_ACCESS, ALL_SCOPES, NO_ACCESS, SpecialUsers
+from tiled.adapters.array import ArrayAdapter
 from tiled.adapters.xarray import DatasetAdapter
 from tiled.structures.array import (
     ArrayStructure,
@@ -30,33 +32,35 @@ from tiled.structures.array import (
     Kind,
     StructDtype,
 )
-from tiled.structures.xarray import (
-    DataArrayStructure,
-    DataArrayMacroStructure,
-    DatasetMacroStructure,
-)
 from tiled.adapters.mapping import MapAdapter
+from tiled.iterviews import KeysView, ItemsView, ValuesView
 from tiled.query_registration import QueryTranslationRegistry
-from tiled.queries import FullText
-from tiled.utils import (
-    SpecialUsers,
-)
+from tiled.queries import Contains, Comparison, Eq, FullText, In, NotEq, NotIn, Regex
 from tiled.adapters.utils import (
     tree_repr,
     IndexersMixin,
 )
+from tiled.structures.core import Spec
 from tiled.utils import import_object, OneShotCachedMap, UNCHANGED
 
 from .common import BlueskyEventStreamMixin, BlueskyRunMixin, CatalogOfBlueskyRunsMixin
 from .queries import (
     BlueskyMapAdapter,
-    RawMongo,
     _PartialUID,
     _ScanID,
+    ScanIDRange,
     TimeRange,
+    contains,
+    comparison,
+    eq,
+    _in,
+    not_eq,
+    not_in,
     partial_uid,
     scan_id,
+    scan_id_range,
     time_range,
+    regex,
 )
 from .server import router
 
@@ -100,17 +104,11 @@ def structure_from_descriptor(descriptor, sub_dict, max_seq_num, unicode_columns
         ),
         micro=FLOAT_DTYPE,
     )
-    time_data_array = DataArrayStructure(
-        macro=DataArrayMacroStructure(
-            variable=time_variable, coords={}, coord_names=[], name="time"
-        ),
-        micro=None,
-    )
     if unicode_columns is None:
         unicode_columns = {}
     dim_counter = itertools.count()
-    data_vars = {}
-    metadata = {"data_vars": {}, "coords": {"time": {"attrs": {}}}}
+    structures = {"time": time_variable}
+    metadata = {"time": {"attrs": {}}}
 
     for key, field_metadata in descriptor["data_keys"].items():
         # if the EventDescriptor doesn't provide names for the
@@ -198,28 +196,27 @@ def structure_from_descriptor(descriptor, sub_dict, max_seq_num, unicode_columns
                 f"dtype={numpy_dtype}"
             ) from err
 
-        variable = ArrayStructure(
+        structures[key] = ArrayStructure(
             macro=ArrayMacroStructure(shape=shape, chunks=chunks, dims=dims),
             micro=dtype,
         )
-        data_array = DataArrayStructure(
-            macro=DataArrayMacroStructure(
-                variable, coords={}, coord_names=["time"], name=key
-            ),
-            micro=None,
-        )
-        data_vars[key] = data_array
-        metadata["data_vars"][key] = {"attrs": attrs}
+        metadata[key] = {"attrs": attrs}
 
-    return (
-        DatasetMacroStructure(data_vars=data_vars, coords={"time": time_data_array}),
-        metadata,
-    )
+    return structures, metadata
+
+
+class DatasetMapAdapter(MapAdapter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def inlined_contents_enabled(self, depth):
+        # Tell the server to in-line the description of each array
+        # (i.e. data_vars and coords) to avoid latency of a second
+        # request.
+        return True
 
 
 class BlueskyRun(MapAdapter, BlueskyRunMixin):
-    specs = ["BlueskyRun"]
-
     def __init__(
         self,
         *args,
@@ -228,9 +225,14 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
         root_map,
         datum_collection,
         resource_collection,
+        specs=None,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        if specs is None:
+            specs = []
+        specs = list(specs)
+        specs.append(Spec("BlueskyRun", version="1"))
+        super().__init__(*args, specs=specs, **kwargs)
         self.transforms = transforms or {}
         self.root_map = root_map
         self._datum_collection = datum_collection
@@ -404,10 +406,14 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
 
 
 class BlueskyEventStream(MapAdapter, BlueskyEventStreamMixin):
-    specs = ["BlueskyEventStream"]
-
-    def __init__(self, *args, event_collection, cutoff_seq_num, run, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self, *args, event_collection, cutoff_seq_num, run, specs=None, **kwargs
+    ):
+        if specs is None:
+            specs = []
+        specs = list(specs)
+        specs.append(Spec("BlueskyEventStream", version="1"))
+        super().__init__(*args, specs=specs, **kwargs)
         self._event_collection = event_collection
         self._cutoff_seq_num = cutoff_seq_num
         self._run = run
@@ -468,81 +474,32 @@ class BlueskyEventStream(MapAdapter, BlueskyEventStreamMixin):
 
 
 class ArrayFromDocuments:
-
-    structure_family = "array"
-    metadata = {}
-
-    def __init__(self, data_array_adapter):
-        self._data_array_adapter = data_array_adapter
-
-    def read(self, slice):
-        return self._data_array_adapter.read(slice)
-
-    def read_block(self, block, slice=None):
-        return self._data_array_adapter.read_block(block, slice=slice)
-
-    def macrostructure(self):
-        return self._data_array_adapter.macrostructure().variable.macro
-
-    def microstructure(self):
-        return self._data_array_adapter.macrostructure().variable.micro
-
-
-class TimeArrayFromDocuments:
-
-    structure_family = "array"
-    metadata = {}
-
-    def __init__(self, data_array_adapter):
-        self._data_array_adapter = data_array_adapter
-
-    def read(self, slice):
-        return self._data_array_adapter.read(slice)
-
-    def read_block(self, block, slice=None):
-        return self._data_array_adapter.read_block(None, block, coord="time", slice=slice)
-
-    def macrostructure(self):
-        return self._data_array_adapter.macrostructure().coords["time"].macro
-
-    def microstructure(self):
-        return self._data_array_adapter.macrostructure().coords["time"].micro
-
-
-class DataArrayFromDocuments:
     """
     Represents one column
     """
 
-    structure_family = "xarray_data_array"
+    structure_family = "array"
 
-    def __init__(self, dataset_adapter, field):
+    def __init__(self, dataset_adapter, field, specs=None):
         self._dataset_adapter = dataset_adapter
         self._field = field
-        self.metadata = dataset_adapter.metadata["data_vars"].get(field, {})
+        self.metadata = dataset_adapter.array_metadata[field]
+        if specs is None:
+            specs = []
+        self.specs = specs
 
     def read_block(self, block, slice=None):
         return self._dataset_adapter.read_block(self._field, block, slice=slice)
 
     def read(self, slice=None):
-        da = self._dataset_adapter.read(fields=[self._field])[self._field]
-        if slice:
-            da = da[slice]
-        return da
-
-    def __getitem__(self, key):
-        if key == "variable":
-            return ArrayFromDocuments(self)
-        elif key == "coords":
-            return MapAdapter({"time": TimeArrayFromDocuments(self)})
-        else:
-            raise KeyError(key)
+        array_adapter = self._dataset_adapter.read(fields=[self._field])[self._field]
+        return array_adapter.read(slice)
 
     def macrostructure(self):
-        return self._dataset_adapter.macrostructure().data_vars[self._field].macro
+        return self._dataset_adapter.array_structures[self._field].macro
 
     def microstructure(self):
-        return self._dataset_adapter.macrostructure().data_vars[self._field].micro
+        return self._dataset_adapter.array_structures[self._field].micro
 
 
 class DatasetFromDocuments:
@@ -550,7 +507,8 @@ class DatasetFromDocuments:
     An xarray.Dataset from a sub-dict of an Event stream
     """
 
-    structure_family = "xarray_dataset"
+    structure_family = "node"
+    specs = [Spec("xarray_dataset")]
 
     def __init__(
         self,
@@ -562,7 +520,6 @@ class DatasetFromDocuments:
         event_collection,
         root_map,
         sub_dict,
-        metadata=None,
     ):
         self._run = run
         self._stream_name = stream_name
@@ -577,8 +534,6 @@ class DatasetFromDocuments:
         #     "stream_name": "...",
         #     "descriptors": [...],
         #     "attrs": {...},
-        #     "data_vars": {...},
-        #     "coords": {"time": {}},
         # }
         # We intentionally do not put the descriptors in attrs (ruins UI)
         # but we put the stream_name there.
@@ -609,21 +564,38 @@ class DatasetFromDocuments:
             # trouble if our guess were too small, and we'll waste space
             # if our guess is too large.
             if unicode_keys:
-                unicode_columns.update(self._get_columns(unicode_keys, slices=None))
+                unicode_columns.update(self.get_columns(unicode_keys, slices=None))
 
-        self._macrostructure, metadata = structure_from_descriptor(
+        self.array_structures, self.array_metadata = structure_from_descriptor(
             descriptor, self._sub_dict, self._cutoff_seq_num, unicode_columns
         )
-        self.metadata.update(metadata)  # adds "data_vars" and "coords"
-        self._data_vars = MapAdapter(
-            {
-                field: DataArrayFromDocuments(self, field)
-                for field in self._macrostructure.data_vars
-            }
+        self._contents = MapAdapter(
+            OneShotCachedMap(
+                {
+                    field: functools.partial(
+                        ArrayFromDocuments,
+                        self,
+                        field,
+                        specs=[Spec("xarray_coord")]
+                        if field == "time"
+                        else [Spec("xarray_data_var")],
+                    )
+                    for field in self.array_structures
+                }
+            )
         )
-        self._coords = MapAdapter(
-            {"time": MapAdapter({"variable": TimeArrayFromDocuments(self)})}
-        )
+
+    def keys(self):
+        return self._contents.keys()
+
+    def values(self):
+        return self._contents.values()
+
+    def items(self):
+        return self._contents.items()
+
+    def __len__(self):
+        return len(self._contents)
 
     def __repr__(self):
         return f"<{type(self).__name__}>"
@@ -639,29 +611,33 @@ class DatasetFromDocuments:
         if self._run.metadata["stop"] is not None:
             return datetime.utcnow() + timedelta(hours=1)
 
-    def macrostructure(self):
-        return self._macrostructure
-
-    def microstructure(self):
-        return None
+    def inlined_contents_enabled(self, depth):
+        # Tell the server to in-line the description of each array
+        # (i.e. data_vars and coords) to avoid latency of a second
+        # request.
+        return True
 
     def read(self, fields=None):
-        # num_blocks = (range(len(n)) for n in chunks)
-        # for block in itertools.product(*num_blocks):
-        structure = self.macrostructure()
-        data_arrays = {}
+        # The client may be requesting multiple fields.
+        # Make batched requests to MongoDB to avoid making
+        # one request per field.
         if fields is None:
-            keys = list(structure.data_vars)
+            keys_to_fetch = list(self.array_structures)
         else:
-            keys = fields
-        columns = self._get_columns(keys, slices=None)
-        # Build the time coordinate.
-        time_coord = self._get_time_coord(slice_params=None)
-        for key, data_array in structure.data_vars.items():
+            keys_to_fetch = list(fields)
+        columns = {}
+        # Since "time" come from a different place in a Event schema,
+        # it is handled specially.
+        if "time" in keys_to_fetch:
+            keys_to_fetch.remove("time")
+            columns["time"] = self._get_time_coord(slice_params=None)
+        if keys_to_fetch:
+            columns.update(self.get_columns(keys_to_fetch, slices=None))
+        mapping = {}
+        for key, structure in self.array_structures.items():
             if (fields is not None) and (key not in fields):
                 continue
-            variable = structure.data_vars[key].macro.variable
-            dtype = variable.micro.to_numpy_dtype()
+            dtype = structure.micro.to_numpy_dtype()
             raw_array = columns[key]
             if raw_array.dtype != dtype:
                 logger.warning(
@@ -675,28 +651,26 @@ class DatasetFromDocuments:
                 array = raw_array.astype(dtype)
             else:
                 array = raw_array
-            data_array = xarray.DataArray(
+            specs = [Spec("xarray_coord")] if key == "time" else [Spec("xarray_data_var")]
+            if isinstance(array, dask.array.Array):
+                constructor = ArrayAdapter
+            else:
+                constructor = ArrayAdapter.from_array
+            mapping[key] = constructor(
                 array,
-                attrs=self.metadata["data_vars"][key]["attrs"],
-                dims=variable.macro.dims,
-                coords={"time": time_coord},
+                metadata=self.array_metadata[key],
+                dims=structure.macro.dims,
+                specs=specs,
             )
-            data_arrays[key] = data_array
-        return xarray.Dataset(data_arrays, coords={"time": time_coord})
+        return DatasetMapAdapter(mapping, metadata=self.metadata, specs=self.specs)
 
     def __getitem__(self, key):
-        if key == "data_vars":
-            return self._data_vars
-        elif key == "coords":
-            return self._coords
-        else:
-            raise KeyError(key)
+        return self._contents[key]
 
-    def read_block(self, variable, block, coord=None, slice=None):
-        structure = self.macrostructure()
-        if coord == "time":
-            data_structure = structure.coords["time"].macro.variable
-            chunks = data_structure.macro.chunks
+    def read_block(self, variable, block, slice=None):
+        structure = self.array_structures[variable]
+        if variable == "time":
+            chunks = structure.macro.chunks
             cumdims = [cached_cumsum(bds, initial_zero=True) for bds in chunks]
             slices_for_chunks = [
                 [builtins.slice(s, s + dim) for s, dim in zip(starts, shapes)]
@@ -704,20 +678,15 @@ class DatasetFromDocuments:
             ]
             (slice_,) = [s[index] for s, index in zip(slices_for_chunks, block)]
             return self._get_time_coord(slice_params=(slice_.start, slice_.stop))
-        elif coord is not None:
-            # We only have a "time" coordinate. Any other coordinate is invalid.
-            raise KeyError(coord)
-        dtype = structure.data_vars[variable].macro.variable.micro.to_numpy_dtype()
-        data_structure = structure.data_vars[variable].macro.variable
-        dtype = data_structure.micro.to_numpy_dtype()
-        chunks = data_structure.macro.chunks
+        dtype = structure.micro.to_numpy_dtype()
+        chunks = structure.macro.chunks
         cumdims = [cached_cumsum(bds, initial_zero=True) for bds in chunks]
         slices_for_chunks = [
             [builtins.slice(s, s + dim) for s, dim in zip(starts, shapes)]
             for starts, shapes in zip(cumdims, chunks)
         ]
         slices = [s[index] for s, index in zip(slices_for_chunks, block)]
-        raw_array = self._get_columns([variable], slices=slices)[variable]
+        raw_array = self.get_columns([variable], slices=slices)[variable]
         if raw_array.dtype != dtype:
             logger.warning(
                 f"{variable!r} actually has dtype {raw_array.dtype.str!r} "
@@ -734,7 +703,6 @@ class DatasetFromDocuments:
             array = array[slice]
         return array
 
-    @functools.lru_cache(maxsize=1024)
     def _get_time_coord(self, slice_params):
         if slice_params is None:
             min_seq_num = 1
@@ -800,7 +768,7 @@ class DatasetFromDocuments:
 
         return numpy.array(column)
 
-    def _get_columns(self, keys, slices):
+    def get_columns(self, keys, slices):
         if slices is None:
             min_seq_num = 1
             max_seq_num = self._cutoff_seq_num
@@ -822,7 +790,6 @@ class DatasetFromDocuments:
 
         return result
 
-    @functools.lru_cache(maxsize=1024)
     def _inner_get_columns(self, keys, min_seq_num, max_seq_num):
         columns = {key: [] for key in keys}
         # IMPORTANT: Access via self.metadata so that transforms are applied.
@@ -1057,12 +1024,12 @@ def build_config_xarray(
         data_array = xarray.DataArray(columns[key], dims=dims, attrs=attrs)
         data_arrays[key] = data_array
     ds = xarray.Dataset(data_arrays)
-    return DatasetAdapter(ds)
+    return DatasetAdapter.from_dataset(ds)
 
 
 class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersMixin):
     structure_family = "node"
-    specs = ["CatalogOfBlueskyRuns"]
+    specs = [Spec("CatalogOfBlueskyRuns", version="1")]
 
     # Define classmethods for managing what queries this MongoAdapter knows.
     query_registry = QueryTranslationRegistry()
@@ -1083,7 +1050,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
         transforms=None,
         metadata=None,
         access_policy=None,
-        principal=None,
         cache_ttl_complete=60,  # seconds
         cache_ttl_partial=2,  # seconds
     ):
@@ -1161,7 +1127,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             cache_of_partial_bluesky_runs=cache_of_partial_bluesky_runs,
             metadata=metadata,
             access_policy=access_policy,
-            principal=principal,
         )
 
     @classmethod
@@ -1173,7 +1138,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
         transforms=None,
         metadata=None,
         access_policy=None,
-        principal=None,
         cache_ttl_complete=60,  # seconds
         cache_ttl_partial=2,  # seconds
     ):
@@ -1246,7 +1210,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             cache_of_partial_bluesky_runs=cache_of_partial_bluesky_runs,
             metadata=metadata,
             access_policy=access_policy,
-            principal=principal,
         )
 
     def __init__(
@@ -1262,7 +1225,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
         queries=None,
         sorting=None,
         access_policy=None,
-        principal=None,
     ):
         "This is not user-facing. Use MongoAdapter.from_uri."
         self._run_start_collection = metadatastore_db.get_collection("run_start")
@@ -1290,16 +1252,7 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
         if sorting is None:
             sorting = [("time", 1)]
         self._sorting = sorting
-        if isinstance(access_policy, str):
-            access_policy = import_object(access_policy)
-        if (access_policy is not None) and (
-            not access_policy.check_compatibility(self)
-        ):
-            raise ValueError(
-                f"Access policy {access_policy} is not compatible with this MongoAdapter."
-            )
-        self._access_policy = access_policy
-        self._principal = principal
+        self.access_policy = access_policy
         self._serializer = None
         super().__init__()
 
@@ -1357,7 +1310,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
         metadata=UNCHANGED,
         queries=UNCHANGED,
         sorting=UNCHANGED,
-        principal=UNCHANGED,
         **kwargs,
     ):
         if metadata is UNCHANGED:
@@ -1366,8 +1318,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             queries = self.queries
         if sorting is UNCHANGED:
             sorting = self._sorting
-        if principal is UNCHANGED:
-            principal = self._principal
         return type(self)(
             *args,
             metadatastore_db=self._metadatastore_db,
@@ -1380,17 +1330,8 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             queries=queries,
             sorting=sorting,
             access_policy=self.access_policy,
-            principal=principal,
             **kwargs,
         )
-
-    @property
-    def access_policy(self):
-        return self._access_policy
-
-    @property
-    def principal(self):
-        return self._principal
 
     @property
     def metadata_stale_at(self):
@@ -1665,29 +1606,28 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             self._build_mongo_query(),
         )
 
-    def authenticated_as(self, identity):
-        if self._principal is not None:
-            raise RuntimeError(
-                f"Already authenticated as {self.principal}"
-            )
-        if self._access_policy is not None:
-            queries = self._access_policy.modify_queries(
-                self.queries,
-                identity,
-            )
-            tree = self.new_variation(principal=identity, queries=queries)
-        else:
-            tree = self.new_variation(principal=identity)
-        return tree
-
     def search(self, query):
         """
         Return a MongoAdapter with a subset of the mapping.
         """
         return self.query_registry(query, self)
 
+    def apply_mongo_query(self, query):
+        return self.new_variation(
+            queries=self.queries + [query],
+        )
+
     def sort(self, sorting):
         return self.new_variation(sorting=sorting)
+
+    def keys(self):
+        return KeysView(lambda: len(self), self._keys_slice)
+
+    def values(self):
+        return ValuesView(lambda: len(self), self._items_slice)
+
+    def items(self):
+        return ItemsView(lambda: len(self), self._items_slice)
 
     def _keys_slice(self, start, stop, direction):
         assert direction == 1, "direction=-1 should be handled by the client"
@@ -1722,20 +1662,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             run = self._get_run(run_start_doc)
             yield (uid, run)
 
-    def _item_by_index(self, index, direction):
-        assert direction == 1, "direction=-1 should be handled by the client"
-        run_start_doc = next(
-            self._chunked_find(
-                self._run_start_collection,
-                self._build_mongo_query(),
-                skip=index,
-                limit=1,
-            )
-        )
-        uid = run_start_doc["uid"]
-        run = self._get_run(run_start_doc)
-        return (uid, run)
-
 
 def full_text_search(query, catalog):
     # First if this catalog is backed by mongomock, which does not support $text queries.
@@ -1750,29 +1676,22 @@ def full_text_search(query, catalog):
             # you have made your choices! :-)
             return BlueskyMapAdapter(dict(catalog)).search(query)
 
-    return MongoAdapter.query_registry(
-        RawMongo(
-            start={
-                "$text": {"$search": query.text, "$caseSensitive": query.case_sensitive}
-            }
-        ),
-        catalog,
+    return catalog.apply_mongo_query(
+        {"$text": {"$search": query.text, "$caseSensitive": query.case_sensitive}},
     )
 
 
-def raw_mongo(query, catalog):
-    # For now, only handle search on the 'run_start' collection.
-    return catalog.new_variation(
-        queries=catalog.queries + [json.loads(query.start)],
-    )
-
-
-# These are implementation-specific definitions.
-MongoAdapter.register_query(FullText, full_text_search)
-MongoAdapter.register_query(RawMongo, raw_mongo)
-# These are generic definitions that use RawMongo internally.
 MongoAdapter.register_query(_PartialUID, partial_uid)
 MongoAdapter.register_query(_ScanID, scan_id)
+MongoAdapter.register_query(ScanIDRange, scan_id_range)
+MongoAdapter.register_query(Comparison, comparison)
+MongoAdapter.register_query(Contains, contains)
+MongoAdapter.register_query(Eq, eq)
+MongoAdapter.register_query(FullText, full_text_search)
+MongoAdapter.register_query(In, _in)
+MongoAdapter.register_query(NotEq, not_eq)
+MongoAdapter.register_query(NotIn, not_in)
+MongoAdapter.register_query(Regex, regex)
 MongoAdapter.register_query(TimeRange, time_range)
 
 
@@ -1787,21 +1706,19 @@ class SimpleAccessPolicy:
     >>> SimpleAccessPolicy({"alice": [<data_session>, key="data_session")
     """
 
-    ALL = object()  # sentinel
+    ALL = ALL_ACCESS
 
-    def __init__(self, access_lists, key, provider):
+    def __init__(self, access_lists, *, key, provider, scopes=None):
         self.access_lists = {}
         self.key = key
         self.provider = provider
-        for identity, entries in (access_lists or {}).items():
-            if isinstance(entries, str):
-                entries = import_object(entries)
-            self.access_lists[identity] = entries
+        self.scopes = scopes if (scopes is not None) else ALL_SCOPES
+        for key, value in access_lists.items():
+            if isinstance(value, str):
+                value = import_object(value)
+            self.access_lists[key] = value
 
-    def check_compatibility(self, catalog):
-        return isinstance(catalog, MongoAdapter)
-
-    def modify_queries(self, queries, principal):
+    def _get_id(self, principal):
         # Get the id (i.e. username) of this Principal for the
         # associated authentication provider.
         for identity in principal.identities:
@@ -1813,13 +1730,32 @@ class SimpleAccessPolicy:
                 f"Principcal {principal} has no identity from provider {self.provider}. "
                 f"Its identities are: {principal.identities}"
             )
-        allowed = self.access_lists.get(id, [])
-        if (id is SpecialUsers.admin) or (allowed is self.ALL):
-            modified_queries = queries
-        else:
-            modified_queries = list(queries)
-            modified_queries.append({self.key: {"$in": allowed}})
-        return modified_queries
+        return id
+
+    def allowed_scopes(self, node, principal):
+        # The simple policy does not provide for different Principals to
+        # have different scopes on different Nodes. If the Principal has access,
+        # they have the same hard-coded access everywhere.
+        return self.scopes
+
+    def filters(self, node, principal, scopes):
+        if not scopes.issubset(self.scopes):
+            return NO_ACCESS
+        id = self._get_id(principal)
+        access_list = self.access_lists.get(id, [])
+        queries = []
+        if not ((principal is SpecialUsers.admin) or (access_list == self.ALL)):
+            try:
+                allowed = set(access_list or [])
+            except TypeError:
+                # Provide rich debugging info because we have encountered a confusing
+                # bug here in a previous implementation.
+                raise TypeError(
+                    f"Unexpected access_list {access_list} of type {type(access_list)}. "
+                    f"Expected iterable or {self.ALL}, instance of {type(self.ALL)}."
+                )
+            queries.append(In(self.key, allowed))
+        return queries
 
 
 def _get_database(uri):
