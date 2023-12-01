@@ -12,8 +12,8 @@ pymongo
 pytz
 rich
 starlette
-suitcase-mongo
-tiled[server] >=0.1.0a89
+suitcase-mongo >=0.4.0
+tiled[server] >=0.1.0a105
 toolz
 typer
 tzlocal

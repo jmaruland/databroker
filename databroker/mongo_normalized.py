@@ -14,7 +14,6 @@ from bson.objectid import ObjectId, InvalidId
 import cachetools
 import entrypoints
 import event_model
-import dask.array
 from dask.array.core import cached_cumsum, normalize_chunks
 import numpy
 import pymongo
@@ -27,7 +26,6 @@ from tiled.adapters.array import ArrayAdapter
 from tiled.adapters.xarray import DatasetAdapter
 from tiled.structures.array import (
     ArrayStructure,
-    ArrayMacroStructure,
     BuiltinDtype,
     Kind,
     StructDtype,
@@ -40,7 +38,7 @@ from tiled.adapters.utils import (
     tree_repr,
     IndexersMixin,
 )
-from tiled.structures.core import Spec
+from tiled.structures.core import Spec, StructureFamily
 from tiled.utils import import_object, OneShotCachedMap, UNCHANGED
 
 from .common import BlueskyEventStreamMixin, BlueskyRunMixin, CatalogOfBlueskyRunsMixin
@@ -97,12 +95,10 @@ def structure_from_descriptor(descriptor, sub_dict, max_seq_num, unicode_columns
         dtype=FLOAT_DTYPE.to_numpy_dtype(),
     )
     time_variable = ArrayStructure(
-        macro=ArrayMacroStructure(
-            shape=time_shape,
-            chunks=time_chunks,
-            dims=["time"],
-        ),
-        micro=FLOAT_DTYPE,
+        shape=time_shape,
+        chunks=time_chunks,
+        dims=["time"],
+        data_type=FLOAT_DTYPE,
     )
     if unicode_columns is None:
         unicode_columns = {}
@@ -196,10 +192,7 @@ def structure_from_descriptor(descriptor, sub_dict, max_seq_num, unicode_columns
                 f"dtype={numpy_dtype}"
             ) from err
 
-        structures[key] = ArrayStructure(
-            macro=ArrayMacroStructure(shape=shape, chunks=chunks, dims=dims),
-            micro=dtype,
-        )
+        structures[key] = ArrayStructure(shape=shape, chunks=chunks, dims=dims, data_type=dtype)
         metadata[key] = {"attrs": attrs}
 
     return structures, metadata
@@ -214,6 +207,9 @@ class DatasetMapAdapter(MapAdapter):
         # (i.e. data_vars and coords) to avoid latency of a second
         # request.
         return True
+
+
+BLUESKYRUN_SPEC = Spec("BlueskyRun", version="1")
 
 
 class BlueskyRun(MapAdapter, BlueskyRunMixin):
@@ -231,7 +227,7 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
         if specs is None:
             specs = []
         specs = list(specs)
-        specs.append(Spec("BlueskyRun", version="1"))
+        specs.append(BLUESKYRUN_SPEC)
         super().__init__(*args, specs=specs, **kwargs)
         self.transforms = transforms or {}
         self.root_map = root_map
@@ -254,7 +250,6 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
         if self._metadata["stop"] is not None:
             return datetime.utcnow() + timedelta(hours=1)
 
-    @property
     def metadata(self):
         "Metadata about this MongoAdapter."
         # If there are transforms configured, shadow the 'start' and 'stop' documents
@@ -279,7 +274,7 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
                     inplace=False,
                 )
                 for descriptor in itertools.chain(
-                    *(stream.metadata["descriptors"] for stream in self.values())
+                    *(stream.metadata()["descriptors"] for stream in self.values())
                 ):
                     filler("descriptor", descriptor)
                 self._filler = filler
@@ -352,7 +347,7 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
             *(stream.iter_descriptors_and_events() for stream in self.values()),
             key=lambda item: item[1]["time"],
         )
-        yield ("start", self.metadata["start"])
+        yield ("start", self.metadata()["start"])
         for name, doc in merged_iter:
             # Insert Datum, Resource as needed, and then yield (name, doc).
             if name == "event":
@@ -391,7 +386,7 @@ class BlueskyRun(MapAdapter, BlueskyRunMixin):
                     if value.get("external")
                 }
             yield name, doc
-        stop_doc = self.metadata["stop"]
+        stop_doc = self.metadata()["stop"]
         if stop_doc is not None:
             yield ("stop", stop_doc)
 
@@ -425,16 +420,15 @@ class BlueskyEventStream(MapAdapter, BlueskyEventStreamMixin):
 
     @property
     def metadata_stale_at(self):
-        if self._run.metadata["stop"] is not None:
+        if self._run.metadata()["stop"] is not None:
             return datetime.utcnow() + timedelta(hours=1)
         return datetime.utcnow() + timedelta(hours=1)
 
     @property
     def entries_stale_at(self):
-        if self._run.metadata["stop"] is not None:
+        if self._run.metadata()["stop"] is not None:
             return datetime.utcnow() + timedelta(hours=1)
 
-    @property
     def metadata(self):
         # If there are transforms configured, shadow the 'descriptor' documents
         # with transfomed copies.
@@ -456,7 +450,7 @@ class BlueskyEventStream(MapAdapter, BlueskyEventStreamMixin):
         )
 
     def iter_descriptors_and_events(self):
-        for descriptor in sorted(self.metadata["descriptors"], key=lambda d: d["time"]):
+        for descriptor in sorted(self.metadata()["descriptors"], key=lambda d: d["time"]):
             yield ("descriptor", descriptor)
             # TODO Grab paginated chunks.
             events = list(
@@ -483,10 +477,13 @@ class ArrayFromDocuments:
     def __init__(self, dataset_adapter, field, specs=None):
         self._dataset_adapter = dataset_adapter
         self._field = field
-        self.metadata = dataset_adapter.array_metadata[field]
+        self._metadata = dataset_adapter.array_metadata[field]
         if specs is None:
             specs = []
         self.specs = specs
+
+    def metadata(self):
+        return self._metadata
 
     def read_block(self, block, slice=None):
         return self._dataset_adapter.read_block(self._field, block, slice=slice)
@@ -495,11 +492,8 @@ class ArrayFromDocuments:
         array_adapter = self._dataset_adapter.read(fields=[self._field])[self._field]
         return array_adapter.read(slice)
 
-    def macrostructure(self):
-        return self._dataset_adapter.array_structures[self._field].macro
-
-    def microstructure(self):
-        return self._dataset_adapter.array_structures[self._field].micro
+    def structure(self):
+        return self._dataset_adapter.array_structures[self._field]
 
 
 class DatasetFromDocuments:
@@ -507,7 +501,7 @@ class DatasetFromDocuments:
     An xarray.Dataset from a sub-dict of an Event stream
     """
 
-    structure_family = "node"
+    structure_family = StructureFamily.container
     specs = [Spec("xarray_dataset")]
 
     def __init__(
@@ -537,16 +531,16 @@ class DatasetFromDocuments:
         # }
         # We intentionally do not put the descriptors in attrs (ruins UI)
         # but we put the stream_name there.
-        self.metadata = self._run[
+        self._metadata = self._run[
             self._stream_name
-        ].metadata.copy()  # {"descriptors": [...], "stream_name: "..."}
+        ].metadata().copy()  # {"descriptors": [...], "stream_name: "..."}
         # Put the stream_name in attrs so it shows up in the xarray repr.
-        self.metadata["attrs"] = {"stream_name": self.metadata["stream_name"]}
+        self._metadata["attrs"] = {"stream_name": self.metadata()["stream_name"]}
 
         # The `data_keys` in a series of Event Descriptor documents with the same
         # `name` MUST be alike, so we can choose one arbitrarily.
         # IMPORTANT: Access via self.metadata so that the transforms are applied.
-        descriptor, *_ = self.metadata["descriptors"]
+        descriptor, *_ = self._metadata["descriptors"]
         unicode_columns = {}
         if self._sub_dict == "data":
             # Collect the keys (column names) that are of unicode data type.
@@ -585,6 +579,9 @@ class DatasetFromDocuments:
             )
         )
 
+    def metadata(self):
+        return self._metadata
+
     def keys(self):
         return self._contents.keys()
 
@@ -602,13 +599,13 @@ class DatasetFromDocuments:
 
     @property
     def metadata_stale_at(self):
-        if self._run.metadata["stop"] is not None:
+        if self._run.metadata()["stop"] is not None:
             return datetime.utcnow() + timedelta(hours=1)
         return datetime.utcnow() + timedelta(hours=1)
 
     @property
     def content_stale_at(self):
-        if self._run.metadata["stop"] is not None:
+        if self._run.metadata()["stop"] is not None:
             return datetime.utcnow() + timedelta(hours=1)
 
     def inlined_contents_enabled(self, depth):
@@ -637,7 +634,7 @@ class DatasetFromDocuments:
         for key, structure in self.array_structures.items():
             if (fields is not None) and (key not in fields):
                 continue
-            dtype = structure.micro.to_numpy_dtype()
+            dtype = structure.data_type.to_numpy_dtype()
             raw_array = columns[key]
             if raw_array.dtype != dtype:
                 logger.warning(
@@ -646,23 +643,21 @@ class DatasetFromDocuments:
                     "It will be converted to the reported type, "
                     "but this should be fixed by setting 'dtype_str' "
                     "in the data_key of the EventDescriptor. "
-                    f"RunStart UID: {self._run.metadata['start']['uid']!r}"
+                    f"RunStart UID: {self._run.metadata()['start']['uid']!r}"
                 )
                 array = raw_array.astype(dtype)
             else:
                 array = raw_array
-            specs = [Spec("xarray_coord")] if key == "time" else [Spec("xarray_data_var")]
-            if isinstance(array, dask.array.Array):
-                constructor = ArrayAdapter
-            else:
-                constructor = ArrayAdapter.from_array
-            mapping[key] = constructor(
+            specs = (
+                [Spec("xarray_coord")] if key == "time" else [Spec("xarray_data_var")]
+            )
+            mapping[key] = ArrayAdapter(
                 array,
                 metadata=self.array_metadata[key],
-                dims=structure.macro.dims,
+                structure=structure,
                 specs=specs,
             )
-        return DatasetMapAdapter(mapping, metadata=self.metadata, specs=self.specs)
+        return DatasetMapAdapter(mapping, metadata=self.metadata(), specs=self.specs)
 
     def __getitem__(self, key):
         return self._contents[key]
@@ -670,7 +665,7 @@ class DatasetFromDocuments:
     def read_block(self, variable, block, slice=None):
         structure = self.array_structures[variable]
         if variable == "time":
-            chunks = structure.macro.chunks
+            chunks = structure.chunks
             cumdims = [cached_cumsum(bds, initial_zero=True) for bds in chunks]
             slices_for_chunks = [
                 [builtins.slice(s, s + dim) for s, dim in zip(starts, shapes)]
@@ -678,8 +673,8 @@ class DatasetFromDocuments:
             ]
             (slice_,) = [s[index] for s, index in zip(slices_for_chunks, block)]
             return self._get_time_coord(slice_params=(slice_.start, slice_.stop))
-        dtype = structure.micro.to_numpy_dtype()
-        chunks = structure.macro.chunks
+        dtype = structure.data_type.to_numpy_dtype()
+        chunks = structure.chunks
         cumdims = [cached_cumsum(bds, initial_zero=True) for bds in chunks]
         slices_for_chunks = [
             [builtins.slice(s, s + dim) for s, dim in zip(starts, shapes)]
@@ -694,7 +689,7 @@ class DatasetFromDocuments:
                 "It will be converted to the reported type, "
                 "but this should be fixed by setting 'dtype_str' "
                 "in the data_key of the EventDescriptor. "
-                f"RunStart UID: {self._run.metadata['start']['uid']!r}"
+                f"RunStart UID: {self._run.metadata()['start']['uid']!r}"
             )
             array = raw_array.astype(dtype)
         else:
@@ -711,7 +706,7 @@ class DatasetFromDocuments:
             min_seq_num = 1 + slice_params[0]
             max_seq_num = 1 + slice_params[1]
         column = []
-        descriptor_uids = [doc["uid"] for doc in self.metadata["descriptors"]]
+        descriptor_uids = [doc["uid"] for doc in self.metadata()["descriptors"]]
 
         def populate_column(min_seq_num, max_seq_num):
             cursor = self._event_collection.aggregate(
@@ -793,7 +788,7 @@ class DatasetFromDocuments:
     def _inner_get_columns(self, keys, min_seq_num, max_seq_num):
         columns = {key: [] for key in keys}
         # IMPORTANT: Access via self.metadata so that transforms are applied.
-        descriptors = self.metadata["descriptors"]
+        descriptors = self.metadata()["descriptors"]
         descriptor_uids = [doc["uid"] for doc in descriptors]
         # The `data_keys` in a series of Event Descriptor documents with the
         # same `name` MUST be alike, so we can just use the first one.
@@ -1028,7 +1023,7 @@ def build_config_xarray(
 
 
 class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersMixin):
-    structure_family = "node"
+    structure_family = StructureFamily.container
     specs = [Spec("CatalogOfBlueskyRuns", version="1")]
 
     # Define classmethods for managing what queries this MongoAdapter knows.
@@ -1341,7 +1336,6 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
     def entries_stale_at(self):
         return None
 
-    @property
     def metadata(self):
         "Metadata about this MongoAdapter."
         return self._metadata
@@ -1366,7 +1360,7 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
             # Choose a cache depending on whethter the run is complete (in
             # which case updates are rare) or incomplete/partial (in which case
             # more data is likely incoming soon).
-            if run.metadata.get("stop") is None:
+            if run.metadata().get("stop") is None:
                 self._cache_of_partial_bluesky_runs[uid] = run
             else:
                 self._cache_of_complete_bluesky_runs[uid] = run
@@ -1427,10 +1421,14 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
                 },
             ]
         )
-        (result,) = cursor
-        cutoff_seq_num = (
-            1 + result["highest_seq_num"]
-        )  # `1 +` because we use a half-open interval
+        results = list(cursor)
+        if results:
+            (result,) = results
+            cutoff_seq_num = (
+                1 + result["highest_seq_num"]
+            )  # `1 +` because we use a half-open interval
+        else:
+            cutoff_seq_num = 1
         object_names = event_descriptors[0]["object_keys"]
         run = self[run_start_uid]
         mapping = OneShotCachedMap(
@@ -1616,6 +1614,60 @@ class MongoAdapter(collections.abc.Mapping, CatalogOfBlueskyRunsMixin, IndexersM
         return self.new_variation(
             queries=self.queries + [query],
         )
+
+    def get_distinct(self, metadata, structure_families, specs, counts):
+        data = {}
+
+        select = {"$match": self._build_mongo_query()}
+
+        if counts:
+            project = {"$project": {"_id": 0, "value": "$_id", "count": "$count"}}
+        else:
+            project = {"$project": {"_id": 0, "value": "$_id"}}
+
+        if metadata:
+            data["metadata"] = {}
+            for metadata_key in metadata:
+                group = {"$group": {"_id": f"${metadata_key}", "count": {"$sum": 1}}}
+
+                start_list = list(
+                    self._run_start_collection.aggregate([select, group, project])
+                )
+                for item in start_list:
+                    if item["value"] is None:
+                        start_list.remove(item)
+                if len(start_list) > 0:
+                    data["metadata"][f"start.{metadata_key}"] = start_list
+
+                stop_list = list(
+                    self._run_stop_collection.aggregate([select, group, project])
+                )
+                for item in stop_list:
+                    if item["value"] is None:
+                        stop_list.remove(item)
+                if len(stop_list) > 0:
+                    data["metadata"][f"stop.{metadata_key}"] = stop_list
+
+        if structure_families or specs:
+            node_size = len(self.apply_mongo_query({}))
+
+        if structure_families:
+            distinct_structure_families = {
+                "value": StructureFamily.container,
+                "count": node_size,
+            }
+            data["structure_families"] = [distinct_structure_families]
+
+        if specs:
+            distinct_specs = {
+                "value": [
+                    {"name": BLUESKYRUN_SPEC.name, "version": BLUESKYRUN_SPEC.version}
+                ],
+                "count": node_size,
+            }
+            data["specs"] = [distinct_specs]
+
+        return data
 
     def sort(self, sorting):
         return self.new_variation(sorting=sorting)

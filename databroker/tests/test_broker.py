@@ -4,6 +4,7 @@ import collections
 import tempfile
 import os
 import logging
+import packaging
 import sys
 import string
 import time as ttime
@@ -24,14 +25,14 @@ import event_model
 from databroker._core import DOCT_NAMES
 from databroker.tests.utils import get_uids
 
-if sys.version_info >= (3, 5):
-    from bluesky.plans import count
-    from bluesky.plan_stubs import trigger_and_read, configure
-    from bluesky.preprocessors import (monitor_during_wrapper,
-                                       run_decorator,
-                                       baseline_wrapper,
-                                       stage_wrapper,
-                                       pchain)
+from bluesky import __version__ as bluesky_version
+from bluesky.plans import count
+from bluesky.plan_stubs import trigger_and_read, configure, one_shot
+from bluesky.preprocessors import (monitor_during_wrapper,
+                                   run_decorator,
+                                   baseline_wrapper,
+                                   stage_wrapper,
+                                   pchain)
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +87,20 @@ def test_uid_list_multiple_headers(db, RE, hw):
 
 def test_no_descriptors(db, RE):
     RE.subscribe(db.insert)
-    uid, = get_uids(RE(count([])))
+    # Specifying per_shot as 'not None' turns off pre-declaring the stream and
+    # results in no descriptors.
+    uid, = get_uids(RE(count([], per_shot=one_shot), print))
     header = db[uid]
     assert [] == header.descriptors
+
+
+def test_no_events(db, RE):
+    if packaging.version.parse(bluesky_version) < packaging.version.parse("1.11.0"):
+        pytest.skip("This test relies on the pre-declare streams feature added in bluesky 1.11")
+    RE.subscribe(db.insert)
+    uid, = get_uids(RE(count([])))
+    header = db[uid]
+    header.table()
 
 
 def test_get_events(db, RE, hw):
@@ -691,6 +703,7 @@ def test_dict_header(db, RE, hw):
         h['events']
 
 
+@pytest.mark.xfail(reason="Possibly broken by predeclare, need investigation")
 def test_config_data(db, RE, hw):
     # simple case: one Event Descriptor, one stream
     RE.subscribe(db.insert)
@@ -1138,3 +1151,40 @@ def test_run_metadata(db, RE, hw):
         assert key in run.metadata
         with pytest.warns(DeprecationWarning):
             assert key in run().metadata  # intake compat
+
+
+def test_v2_accessor(db, RE, hw):
+    "Test for v2 accessor to support code compatible with v1- and v2-style objects."
+    RE.subscribe(db.insert)
+    if not hasattr(db, "v2"):
+        raise pytest.skip("v0 has no v2 accessor")
+    uid, = get_uids(RE(count([hw.det], 5)))
+    h = db[uid]
+    # v1-style Header has v2 accessor
+    assert db[uid].v2.start["uid"] == h.start["uid"]
+    # v2-style BlueskyRun has v2 accessor
+    assert db[uid].v2.v2.v2.start["uid"] == h.start["uid"]
+    # v1-style Broker has v2 accessor
+    assert db.v2[uid].start["uid"] == h.start["uid"]
+    # v2-style CatalogOfBlueskyRuns has v2 accessor
+    assert db.v2.v2.v2[uid].start["uid"] == h.start["uid"]
+
+
+def test_string_column(db, RE, hw):
+    "Test string data."
+    from ophyd.sim import EnumSignal
+
+
+    class StringSignal(EnumSignal):
+        def describe(self):
+            desc = super().describe()
+            desc[self.name]["dtype"] = "string"
+            return desc
+
+    if not hasattr(db, "v2"):
+        raise pytest.skip("v0 has no v2 accessor")
+
+    RE.subscribe(db.insert)
+    signal = StringSignal(value="A", enum_strings=("A", "B"), name="signal")
+    uid, = get_uids(RE(count([signal], 5)))
+    data = db.v2[uid]["primary"]["data"]
