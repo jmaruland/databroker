@@ -4,11 +4,13 @@ import collections
 import tempfile
 import os
 import logging
+import numbers
 import packaging
 import sys
 import string
 import time as ttime
 import uuid
+from contextlib import nullcontext as does_not_raise
 from datetime import date, timedelta
 import itertools
 from databroker import (wrap_in_doct, wrap_in_deprecated_doct,
@@ -16,6 +18,7 @@ from databroker import (wrap_in_doct, wrap_in_deprecated_doct,
 from .test_config import EXAMPLE
 import doct
 import copy
+import warnings
 
 import pytest
 import six
@@ -234,6 +237,60 @@ def test_indexing(db_empty, RE, hw):
     with pytest.raises(IndexError):
         # too far back
         db[-11]
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    (
+        # These values are in range...
+        (np.int64(1), does_not_raise()),  # Key is a Scan ID
+        (np.int64(-1), does_not_raise()),  # Key is Nth-last scan
+        # These values are out of range...
+        (np.int64(10), pytest.raises(KeyError)),  # Scan ID does not exist
+        (-np.int64(10), pytest.raises(IndexError)),  # Abs(key) > number of scans
+    ),
+)
+def test_int64_indexing(db_empty, RE, hw, key, expected):
+    """numpy.int64 can be used as a catalog key; it is treated as an int key"""
+    db = db_empty
+    RE.subscribe(db.insert)
+
+    uids = []
+    for i in range(2):
+        uids.extend(get_uids(RE(count([hw.det]))))
+
+    assert not isinstance(key, int)
+    assert isinstance(key, numbers.Integral)
+    assert key == int(key)
+    with expected:
+        db[key]
+
+
+@pytest.mark.parametrize(
+    "key, expected",
+    (
+        # >32-bit values are ok...
+        (np.int64(2**33), does_not_raise()),  # Scan ID exists
+        # But these values are out of range...
+        (np.int64(2**33 + 2), pytest.raises(KeyError)),  # Scan ID does not exist
+        (-np.int64(2**33), pytest.raises(IndexError)),  # Abs(key) > number of scans
+    ),
+)
+def test_large_int_indexing(db_empty, RE, hw, key, expected):
+    """Integer-valued catalog key can exceed 32-bit values"""
+    db = db_empty
+    RE.md["scan_id"] = 2**33 - 1
+    RE.subscribe(db.insert)
+
+    uids = []
+    for i in range(2):
+        uids.extend(get_uids(RE(count([hw.det]))))
+
+    assert not isinstance(key, int)
+    assert isinstance(key, numbers.Integral)
+    assert key == int(key)
+    with expected:
+        db[key]
 
 
 def test_full_text_search(db_empty, RE, hw):
@@ -860,13 +917,13 @@ def test_deprecated_doct():
         ev.data
         ev._name
 
-    with pytest.warns(None) as record:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         ev['data']
         ev.values()
         ev._repr_html_()
         with pytest.raises(AttributeError):
             ev.nonexistent
-    assert not record  # i.e. assert no warning
 
 
 def test_ingest_array_data(db_empty, RE):
@@ -1199,6 +1256,7 @@ def test_string_column(db, RE, hw):
     uid, = get_uids(RE(count([signal], 5)))
     data = db.v2[uid]["primary"]["data"]
 
+
 def test_large_document():
     API_URL = "https://tiled-demo.blueskyproject.io/api/v1/"
     try:
@@ -1208,3 +1266,45 @@ def test_large_document():
     c = from_uri(API_URL)
     run = c["csx"]["raw"]["ca658886-ee6b-4b3c-b47f-a58b08dbac8b"]
     list(run.documents())
+
+
+def test_update(db, RE, hw):
+    RE.subscribe(db.insert)
+    if not hasattr(db, "v2"):
+        raise pytest.skip("v0 has no v2 accessor")
+    c = db.v2
+    uid, = get_uids(RE(count([hw.det], 5)))
+    c[uid].update_metadata(
+        {
+            "start": {
+                "test_new_start_key": "foo",
+                "plan_name": "test_was_here",
+            },
+            "stop": {"test_new_stop_key": "foo"}
+        },
+    )
+    assert "test_new_start_key" in c[uid].metadata["start"]
+    assert c[uid].metadata["start"]["plan_name"] == "test_was_here"
+    assert "test_new_stop_key" in c[uid].metadata["stop"]
+    with pytest.raises(ValueError):
+        c[uid].update_metadata({"start": {"uid": "not allowed to change this"}})
+
+
+def test_img_read(db, RE, hw):
+    "Test reading 2D data referenced by Datum, Resource."
+    RE.subscribe(db.insert)
+    if not hasattr(db, "v2"):
+        raise pytest.skip("v0 has no v2 accessor")
+    c = db.v2
+    uid, = get_uids(RE(count([hw.img], 5)))
+    c[uid]["primary"]["data"]["img"][:]
+
+
+def test_direct_img_read(db, RE, hw):
+    "Test reading 2D data placed directly in the Event document."
+    RE.subscribe(db.insert)
+    if not hasattr(db, "v2"):
+        raise pytest.skip("v0 has no v2 accessor")
+    c = db.v2
+    uid, = get_uids(RE(count([hw.direct_img], 5)))
+    c[uid]["primary"]["data"]["img"][:]

@@ -3,8 +3,11 @@ cachetools
 entrypoints
 event-model
 fastapi
+json-merge-patch
+jsonpatch
 jsonschema
 mongomock
+mongoquery
 msgpack >=1.0.0
 pims
 pydantic
@@ -12,8 +15,8 @@ pymongo
 pytz
 rich
 starlette
-suitcase-mongo >=0.4.0
-tiled[server] >=0.1.0a110
+suitcase-mongo >=0.5.0
+tiled[server] >=0.1.0b4
 toolz
 typer
 tzlocal
